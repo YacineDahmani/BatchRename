@@ -1,0 +1,6 @@
+renamer
+renamer.exe
+tmp_test/
+tmp_conflict/
+*.o
+*.obj
