@@ -104,6 +104,10 @@ int collect_matching_files(const char *folder, const char *ext, char ***files_ou
         return -1;
     }
 
+    /*
+     * Scan directory entries and collect names that end with `ext`.
+     * Skip dot-prefixed (hidden) entries and non-regular files.
+     */
     while (1) {
         char full_path[PATH_BUFFER_SIZE];
         char *name_copy;
@@ -119,6 +123,7 @@ int collect_matching_files(const char *folder, const char *ext, char ***files_ou
             break;
         }
 
+        // Skip hidden files and directory entries starting with a dot
         if (entry->d_name[0] == '.') {
             continue;
         }
@@ -182,6 +187,10 @@ void sort_files(char **files, size_t count) {
 
 int perform_renames(const char *folder, const char *ext, const char *prefix, int padding,
                     char **files, size_t count) {
+    /*
+     * Pre-generate all target basenames (prefix + zero-padded number + ext)
+     * so we can detect conflicts before performing any filesystem changes.
+     */
     char **new_names;
     size_t i;
 
@@ -214,6 +223,10 @@ int perform_renames(const char *folder, const char *ext, const char *prefix, int
         }
     }
 
+    /*
+     * Preflight check: ensure no target path already exists on disk (or is
+     * also present in the source list). Abort early to avoid partial renames.
+     */
     for (i = 0; i < count; i++) {
         char new_path[PATH_BUFFER_SIZE];
         struct stat st;
@@ -244,6 +257,7 @@ int perform_renames(const char *folder, const char *ext, const char *prefix, int
         }
     }
 
+    /* Perform the actual renames now that preflight checks passed. */
     for (i = 0; i < count; i++) {
         char old_path[PATH_BUFFER_SIZE];
         char new_path[PATH_BUFFER_SIZE];

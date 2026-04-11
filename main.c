@@ -34,6 +34,7 @@ int main(int argc, char **argv) {
     size_t file_count = 0;
     int rc;
 
+    // Expect exactly 4 user arguments (program name + 4)
     if (argc != 5) {
         print_usage(argv[0]);
         return 1;
@@ -53,6 +54,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // Collect filenames in `folder` that end with `ext`.
+    // Returns an allocated `char **` array and the number of entries.
     rc = collect_matching_files(folder, ext, &files, &file_count);
     if (rc != 0) {
         return 1;
@@ -63,8 +66,10 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    // Sort filenames deterministically (alphabetical) so renames are predictable.
     sort_files(files, file_count);
 
+    // Build new names with zero-padded numbers and perform the renames.
     rc = perform_renames(folder, ext, prefix, padding, files, file_count);
     free_file_list(files, file_count);
 
