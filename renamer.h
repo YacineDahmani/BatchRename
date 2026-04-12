@@ -3,11 +3,42 @@
 
 #include <stddef.h>
 
-int str_ends_with(const char *str, const char *suffix);
-int collect_matching_files(const char *folder, const char *ext, char ***files_out, size_t *count_out);
-void sort_files(char **files, size_t count);
-int perform_renames(const char *folder, const char *ext, const char *prefix, int padding,
-                    char **files, size_t count);
-void free_file_list(char **files, size_t count);
+typedef enum MatchMode {
+    MATCH_MODE_EXTENSION = 0,
+    MATCH_MODE_REGEX = 1
+} MatchMode;
+
+typedef enum SortMode {
+    SORT_MODE_NAME = 0,
+    SORT_MODE_CTIME = 1,
+    SORT_MODE_SIZE = 2
+} SortMode;
+
+typedef struct RenameOptions {
+    const char *base_folder;
+    MatchMode match_mode;
+    const char *extension;
+    const char *regex_pattern;
+    const char *prefix;
+    int padding;
+    int recursive;
+    int dry_run;
+    int assume_yes;
+    SortMode sort_mode;
+} RenameOptions;
+
+typedef struct FileEntry {
+    char *folder_path;
+    char *name;
+    long long creation_time;
+    long long size_bytes;
+} FileEntry;
+
+int collect_matching_files(const RenameOptions *options, FileEntry **files_out, size_t *count_out);
+void sort_files(FileEntry *files, size_t count, SortMode sort_mode);
+int perform_renames(const RenameOptions *options, FileEntry *files, size_t count,
+                    const char *history_path);
+int undo_last_batch(const char *history_path, int assume_yes);
+void free_file_entries(FileEntry *files, size_t count);
 
 #endif

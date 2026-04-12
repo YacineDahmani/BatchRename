@@ -1,93 +1,75 @@
 # BatchRename
 
-BatchRename is a small C command-line tool that renames every file in a folder that matches a given extension. It processes files in sorted order, then assigns new names using a custom prefix and zero-padded numbering.
-
-## What it does
-
-Example:
-
-```bash
-./renamer ./photos .jpg photo_ 3
-```
-
-If the folder contains files like `DSC001.jpg`, `IMG_4892.jpg`, and `a_pic.jpg`, the tool will rename them in alphabetical order to:
-
-```text
-photo_001.jpg
-photo_002.jpg
-photo_003.jpg
-```
-
-Hidden files and files that do not end with the requested extension are ignored.
-
-## How it works
-
-The program is split into two main parts:
-
-1. `main.c` handles argument parsing and validation.
-2. `renamer.c` scans the directory, sorts matching filenames, builds the new names, and performs the renames.
-
-The workflow is:
-
-1. Read the folder path, extension, prefix, and padding from the command line.
-2. Open the folder with `opendir()` and collect matching filenames with `readdir()`.
-3. Sort the collected filenames with `qsort()` so the rename order is predictable.
-4. Build each new name with `snprintf()` using zero-padded numbering.
-5. Rename each file with `rename()` and print the mapping.
-6. Free all allocated memory before exiting.
-
-## Usage
-
-```bash
-./renamer <folder> <ext> <prefix> <padding>
-```
-
-Arguments:
-
-- `folder`: folder containing the files to rename
-- `ext`: file extension to match, for example `.jpg`
-- `prefix`: new filename prefix, for example `photo_`
-- `padding`: number of digits for numbering, for example `3` produces `001`, `002`, `003`
+BatchRename is a C command-line tool for safe batch file renaming. It supports extension-based and regex-based matching, recursive processing, alternate sort modes, dry runs, interactive confirmation, and undo of the last successful batch.
 
 ## Build
 
-Build the project with `make`:
+Run:
 
-```bash
 make
-```
 
 To remove build output:
 
-```bash
 make clean
-```
 
-## Example
+## Usage
 
-```bash
-./renamer ./photos .jpg photo_ 3
-```
+Extension mode:
 
-With input files:
+./renamer [options] FOLDER EXT PREFIX PADDING
+
+Regex mode:
+
+./renamer [options] --regex PATTERN FOLDER PREFIX PADDING
+
+Undo mode:
+
+./renamer undo [--yes] [history-file]
+
+## Options
+
+- --dryrun: Show exactly what would be renamed without changing files. Dry runs do not write history.
+- --yes: Skip interactive confirmation prompts.
+- -r, --recursive: Traverse subfolders recursively. Numbering is global across the full matched tree.
+- --sort MODE: Sort mode is name, ctime, or size.
+- --regex PATTERN: Use regex matching instead of extension matching. Mutually exclusive with extension positional matching.
+
+## Matching Rules
+
+- Extension mode matches files whose names end with the provided extension.
+- Regex mode searches within the full filename using substring-style regex search.
+- Example pattern IMG_[0-9]{4} matches IMG_0001.jpg and IMG_1234.png.
+- Hidden files and hidden directories (names starting with .) are skipped.
+
+## Rename Output Rules
+
+- New names are generated as PREFIX + zero-padded index + extension.
+- In extension mode, the provided extension is used for output names.
+- In regex mode, each file keeps its own original extension.
+
+## Safety Features
+
+- Dry run preview before touching files.
+- Interactive confirmation by default for real renames with prompt: Proceed with N renames? (y/n)
+- Preflight conflict detection before execution to avoid avoidable partial changes.
+- Undo support for the last successful batch.
+
+## Undo
+
+- Every successful non-dry batch is appended to .rename_history.
+- History entries store old and new absolute paths.
+- Undo reverts only the latest batch and removes it from history after success.
+
+Examples:
 
 ```text
-DSC001.jpg
-IMG_4892.jpg
-a_pic.jpg
-```
-
-The output becomes:
-
-```text
-photo_001.jpg
-photo_002.jpg
-photo_003.jpg
+./renamer --yes photos .jpg photo_ 3
+./renamer --dryrun -r --sort size --regex IMG_[0-9]{4} photos batch_ 2
+./renamer undo
+./renamer undo --yes .rename_history
 ```
 
 ## Notes
 
-- The tool currently works on one folder level only.
-- Files are renamed in alphabetical order, not by creation time.
-- The program checks for basic input errors and rename conflicts.
-- Generated files and temporary test folders are ignored by Git.
+- If a rename fails mid-batch due to external filesystem changes, some files may already be renamed.
+- Undo performs its own preflight checks and applies operations in reverse order.
