@@ -1,92 +1,100 @@
 # BatchRename
 
-BatchRename is a C command-line tool for safe batch file renaming. It supports extension-based and regex-based matching, recursive processing, alternate sort modes, dry runs, interactive confirmation, and undo of the last successful batch.
+BatchRename is a high-performance, precision command-line utility written in C for safe and efficient batch file renaming. It provides a robust set of features for organizing large collections of files with precision and safety.
 
-## Build
+## Features
 
-Run:
+- **Precision Matching**: Support for simple extension matching or advanced Regular Expressions.
+- **Recursive Processing**: Global numbering across entire directory trees.
+- **Safety by Design**: 
+  - **Dry Runs**: Preview every change before it happens.
+  - **Conflict Detection**: Checks for name collisions before execution.
+  - **Two-Phase Atomic Renames**: Prevents data loss during chain or cycle renames.
+  - **Rollback System**: Automatic attempt to revert on partial failures.
+- **Instant Undo**: Revert the last successful batch with a single command.
+- **Flexible Sorting**: Order files by name, creation time, or file size.
+- **Smart Padding**: Customizable zero-padding for perfectly aligned filenames.
 
+## Getting Started
+
+### Prerequisites
+- A C compiler (GCC, Clang, or MSVC)
+- Make (optional)
+
+### Build and Install
+Clone the repository and build the binary:
+
+```bash
+git clone https://github.com/YacineDahmani/BatchRename.git
+cd BatchRename
 make
+```
 
-Run basic regression checks:
-
+To run tests:
+```bash
 make test
-
-To remove build output:
-
-make clean
+```
 
 ## Usage
 
-Extension mode:
+### Simple Extension Mode
+Rename all `.jpg` files in a folder to `vacation_001.jpg`, `vacation_002.jpg`, etc.
+```bash
+./renamer ./photos .jpg vacation_ 3
+```
 
-./renamer [options] FOLDER EXT PREFIX PADDING
+### Advanced Regex Mode
+Match specific patterns and keep original extensions.
+```bash
+./renamer --regex "IMG_[0-9]{4}" ./photos batch_ 2
+```
 
-Regex mode:
-
-./renamer [options] --regex PATTERN FOLDER PREFIX PADDING
-
-Undo mode:
-
-./renamer undo [--yes] [history-file]
+### Undo Last Action
+Accidentally renamed the wrong files? Run the undo command:
+```bash
+./renamer undo
+```
 
 ## Options
 
-- --dryrun: Show exactly what would be renamed without changing files. Dry runs do not write history.
-- --yes: Skip interactive confirmation prompts.
-- -r, --recursive: Traverse subfolders recursively. Numbering is global across the full matched tree.
-- --sort MODE: Sort mode is name, ctime, or size.
-- --regex PATTERN: Use regex matching instead of extension matching. Mutually exclusive with extension positional matching.
+| Flag | Description |
+| :--- | :--- |
+| `--dryrun` | View planned changes without modifying any files. |
+| `--yes` | Skip interactive confirmation prompts. |
+| `-r`, `--recursive` | Traverse subdirectories recursively. |
+| `--sort <mode>` | Sort files by `name`, `ctime`, or `size`. (Default: `name`) |
+| `--regex <pattern>` | Use regex matching (supports `^`, `$`, `*`, `+`, `?`, `{m,n}`, etc.). |
 
-## Matching Rules
+## Safety Architecture
 
-- Extension mode matches files whose names end with the provided extension.
-- Regex mode searches within the full filename using substring-style regex search.
-- Regex mode supports literals, `.`, character classes `[abc]` and `[^abc]`, escapes with `\\`, and quantifiers `*`, `+`, `?`, `{m}`, `{m,n}`, `{m,}`.
-- Anchors are supported: `^` anchors to start of filename and `$` anchors to end.
-- Invalid quantifier placement (for example starting with `*`) is rejected with an explicit parse error.
-- Example pattern IMG_[0-9]{4} matches IMG_0001.jpg and IMG_1234.png.
-- Hidden files and hidden directories (names starting with .) are skipped.
+BatchRename employs a two-phase execution model to ensure data integrity:
+1. **Pre-flight Check**: Validates permissions and detects potential filename collisions.
+2. **Phase 1 (Temp Move)**: Moves all target files to a unique temporary name.
+3. **Phase 2 (Final Move)**: Renames temporary files to their final destination.
 
-## Rename Output Rules
+This architecture ensures that complex operations, such as "swapping" filenames or circular renames, are handled without data loss.
 
-- New names are generated as PREFIX + zero-padded index + extension.
-- In extension mode, the provided extension is used for output names.
-- In regex mode, each file keeps its own original extension.
+## Examples
 
-## Safety Features
-
-- Dry run preview before touching files.
-- Interactive confirmation by default for real renames with prompt: Proceed with N renames? (y/n)
-- Preflight conflict detection before execution.
-- Two-phase rename execution (`source -> temp -> target`) to handle chain/swap/cycle mappings safely.
-- Automatic rollback attempt if an error happens during execution.
-- Undo support for the last successful batch.
-
-## Undo
-
-- Every successful non-dry batch is appended to .rename_history.
-- History entries store old and new absolute paths.
-- Undo reverts only the latest batch and removes it from history after success.
-
-Examples:
-
-```text
-./renamer --yes photos .jpg photo_ 3
-./renamer --dryrun -r --sort size --regex IMG_[0-9]{4} photos batch_ 2
-./renamer undo
-./renamer undo --yes .rename_history
+**Sort by size and rename recursively**
+```bash
+./renamer -r --sort size ./assets .png asset_ 4
 ```
 
-PowerShell equivalents on Windows:
-
-```text
-.\renamer --yes photos .jpg photo_ 3
-.\renamer --dryrun -r --sort size --regex '^IMG_[0-9]{4}\.jpg$' photos batch_ 2
-.\renamer undo --yes
+**Regex match at start of line with dry run**
+```bash
+./renamer --dryrun --regex "^temp_" ./work prefix_ 2
 ```
 
-## Notes
+**Interactive undo with custom history file**
+```bash
+./renamer undo ./custom_history.log
+```
 
-- On Windows, file operations use WinAPI path handling with extended path support for deep trees.
-- Undo now uses the same two-phase safety model as forward renames.
+## Windows Compatibility
+BatchRename is fully compatible with Windows and utilizes WinAPI for robust path handling, including support for extended paths (exceeding 260 characters).
+
+**PowerShell Usage:**
+```powershell
+.\renamer.exe --yes photos .jpg photo_ 3
+```
