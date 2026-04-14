@@ -8,6 +8,10 @@ Run:
 
 make
 
+Run basic regression checks:
+
+make test
+
 To remove build output:
 
 make clean
@@ -38,6 +42,9 @@ Undo mode:
 
 - Extension mode matches files whose names end with the provided extension.
 - Regex mode searches within the full filename using substring-style regex search.
+- Regex mode supports literals, `.`, character classes `[abc]` and `[^abc]`, escapes with `\\`, and quantifiers `*`, `+`, `?`, `{m}`, `{m,n}`, `{m,}`.
+- Anchors are supported: `^` anchors to start of filename and `$` anchors to end.
+- Invalid quantifier placement (for example starting with `*`) is rejected with an explicit parse error.
 - Example pattern IMG_[0-9]{4} matches IMG_0001.jpg and IMG_1234.png.
 - Hidden files and hidden directories (names starting with .) are skipped.
 
@@ -51,7 +58,9 @@ Undo mode:
 
 - Dry run preview before touching files.
 - Interactive confirmation by default for real renames with prompt: Proceed with N renames? (y/n)
-- Preflight conflict detection before execution to avoid avoidable partial changes.
+- Preflight conflict detection before execution.
+- Two-phase rename execution (`source -> temp -> target`) to handle chain/swap/cycle mappings safely.
+- Automatic rollback attempt if an error happens during execution.
 - Undo support for the last successful batch.
 
 ## Undo
@@ -69,7 +78,15 @@ Examples:
 ./renamer undo --yes .rename_history
 ```
 
+PowerShell equivalents on Windows:
+
+```text
+.\renamer --yes photos .jpg photo_ 3
+.\renamer --dryrun -r --sort size --regex '^IMG_[0-9]{4}\.jpg$' photos batch_ 2
+.\renamer undo --yes
+```
+
 ## Notes
 
-- If a rename fails mid-batch due to external filesystem changes, some files may already be renamed.
-- Undo performs its own preflight checks and applies operations in reverse order.
+- On Windows, file operations use WinAPI path handling with extended path support for deep trees.
+- Undo now uses the same two-phase safety model as forward renames.
