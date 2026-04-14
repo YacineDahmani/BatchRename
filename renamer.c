@@ -9,18 +9,29 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <wchar.h>
 
 #ifdef _WIN32
 #include <direct.h>
+#include <process.h>
+#include <windows.h>
 #define getcwd _getcwd
+#define get_process_id _getpid
+#define PATH_SEPARATOR '\\'
+#else
+#include <unistd.h>
+#define get_process_id getpid
+#define PATH_SEPARATOR '/'
 #endif
 
 #define INITIAL_CAPACITY 16
 #define NAME_BUFFER_SIZE 1024
-#define PATH_BUFFER_SIZE 4096
 #define HISTORY_LINE_BUFFER_SIZE 16384
 #define REGEX_CLASS_SIZE 256
 #define REGEX_REPEAT_UNBOUNDED (-1)
+#define REGEX_MAX_PATTERN_LENGTH 512
+#define REGEX_MAX_TOKEN_COUNT 256
+#define TEMP_NAME_ATTEMPTS 2048
 
 typedef enum PatternAtomType {
     PATTERN_LITERAL = 0,
@@ -39,6 +50,8 @@ typedef struct PatternToken {
 typedef struct CompiledPattern {
     PatternToken *tokens;
     size_t count;
+    int anchor_start;
+    int anchor_end;
 } CompiledPattern;
 
 typedef struct HistoryBatch {
@@ -52,6 +65,10 @@ typedef struct HistoryBatch {
 } HistoryBatch;
 
 static SortMode g_sort_mode = SORT_MODE_NAME;
+
+static int is_path_separator(char ch) {
+    return ch == '/' || ch == '\\';
+}
 
 static char *duplicate_string(const char *source) {
     size_t len;
@@ -85,29 +102,261 @@ static void free_string_array(char **values, size_t count) {
     free(values);
 }
 
-static int build_path(char *out, size_t out_size, const char *folder, const char *name) {
-    size_t folder_len;
-    const char *separator = "";
-    int written;
+#ifdef _WIN32
+static void normalize_windows_separators(char *path) {
+    size_t i;
 
-    if (!out || !folder || !name || out_size == 0) {
-        return -1;
+    if (!path) {
+        return;
+    }
+
+    for (i = 0; path[i] != '\0'; i++) {
+        if (path[i] == '/') {
+            path[i] = '\\';
+        }
+    }
+}
+
+static wchar_t *multi_to_wide_best_effort(const char *text) {
+    int required;
+    wchar_t *wide;
+
+    if (!text) {
+        return NULL;
+    }
+
+    required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, NULL, 0);
+    if (required <= 0) {
+        required = MultiByteToWideChar(CP_ACP, 0, text, -1, NULL, 0);
+        if (required <= 0) {
+            return NULL;
+        }
+
+        wide = (wchar_t *)malloc((size_t)required * sizeof(wchar_t));
+        if (!wide) {
+            return NULL;
+        }
+
+        if (MultiByteToWideChar(CP_ACP, 0, text, -1, wide, required) <= 0) {
+            free(wide);
+            return NULL;
+        }
+
+        return wide;
+    }
+
+    wide = (wchar_t *)malloc((size_t)required * sizeof(wchar_t));
+    if (!wide) {
+        return NULL;
+    }
+
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, wide, required) <= 0) {
+        free(wide);
+        return NULL;
+    }
+
+    return wide;
+}
+
+static char *wide_to_utf8_copy(const wchar_t *text) {
+    int required;
+    char *utf8;
+
+    if (!text) {
+        return NULL;
+    }
+
+    required = WideCharToMultiByte(CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL);
+    if (required <= 0) {
+        return NULL;
+    }
+
+    utf8 = (char *)malloc((size_t)required);
+    if (!utf8) {
+        return NULL;
+    }
+
+    if (WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, required, NULL, NULL) <= 0) {
+        free(utf8);
+        return NULL;
+    }
+
+    return utf8;
+}
+
+static wchar_t *get_full_path_wide_windows(const char *path) {
+    DWORD required;
+    wchar_t *input;
+    wchar_t *full_path;
+
+    if (!path) {
+        return NULL;
+    }
+
+    input = multi_to_wide_best_effort(path);
+    if (!input) {
+        return NULL;
+    }
+
+    required = GetFullPathNameW(input, 0, NULL, NULL);
+    if (required == 0) {
+        free(input);
+        return NULL;
+    }
+
+    full_path = (wchar_t *)malloc(((size_t)required + 1) * sizeof(wchar_t));
+    if (!full_path) {
+        free(input);
+        return NULL;
+    }
+
+    if (GetFullPathNameW(input, required + 1, full_path, NULL) == 0) {
+        free(full_path);
+        free(input);
+        return NULL;
+    }
+
+    free(input);
+    return full_path;
+}
+
+static char *get_full_path_copy_windows(const char *path) {
+    wchar_t *full_wide;
+    char *utf8_path;
+
+    full_wide = get_full_path_wide_windows(path);
+    if (!full_wide) {
+        return NULL;
+    }
+
+    utf8_path = wide_to_utf8_copy(full_wide);
+    free(full_wide);
+    if (!utf8_path) {
+        return NULL;
+    }
+
+    normalize_windows_separators(utf8_path);
+    return utf8_path;
+}
+
+static int has_extended_prefix_wide(const wchar_t *path) {
+    return path && wcsncmp(path, L"\\\\?\\", 4) == 0;
+}
+
+static wchar_t *build_windows_extended_path_w(const char *path) {
+    wchar_t *absolute;
+    size_t len;
+
+    if (!path) {
+        return NULL;
+    }
+
+    absolute = get_full_path_wide_windows(path);
+    if (!absolute) {
+        return NULL;
+    }
+
+    if (has_extended_prefix_wide(absolute)) {
+        return absolute;
+    }
+
+    len = wcslen(absolute);
+    if (len < 240) {
+        return absolute;
+    }
+
+    if (len >= 2 && absolute[0] == L'\\' && absolute[1] == L'\\') {
+        const wchar_t *prefix = L"\\\\?\\UNC\\";
+        size_t prefix_len = wcslen(prefix);
+        wchar_t *with_prefix =
+            (wchar_t *)malloc((prefix_len + (len - 2) + 1) * sizeof(wchar_t));
+        if (!with_prefix) {
+            free(absolute);
+            return NULL;
+        }
+
+        wmemcpy(with_prefix, prefix, prefix_len);
+        wmemcpy(with_prefix + prefix_len, absolute + 2, len - 1);
+        with_prefix[prefix_len + (len - 2)] = L'\0';
+        free(absolute);
+        return with_prefix;
+    }
+
+    {
+        const wchar_t *prefix = L"\\\\?\\";
+        size_t prefix_len = wcslen(prefix);
+        wchar_t *with_prefix = (wchar_t *)malloc((prefix_len + len + 1) * sizeof(wchar_t));
+        if (!with_prefix) {
+            free(absolute);
+            return NULL;
+        }
+
+        wmemcpy(with_prefix, prefix, prefix_len);
+        wmemcpy(with_prefix + prefix_len, absolute, len + 1);
+        free(absolute);
+        return with_prefix;
+    }
+}
+#endif
+
+static int path_equals(const char *left, const char *right) {
+    size_t i = 0;
+
+    if (!left || !right) {
+        return 0;
+    }
+
+#ifdef _WIN32
+    while (left[i] != '\0' && right[i] != '\0') {
+        unsigned char lch = (unsigned char)left[i];
+        unsigned char rch = (unsigned char)right[i];
+
+        if (lch == '/') {
+            lch = '\\';
+        }
+        if (rch == '/') {
+            rch = '\\';
+        }
+
+        if (tolower(lch) != tolower(rch)) {
+            return 0;
+        }
+
+        i++;
+    }
+
+    return left[i] == '\0' && right[i] == '\0';
+#else
+    return strcmp(left, right) == 0;
+#endif
+}
+
+static char *build_path_alloc(const char *folder, const char *name) {
+    size_t folder_len;
+    size_t name_len;
+    int needs_separator;
+    char *joined;
+
+    if (!folder || !name) {
+        return NULL;
     }
 
     folder_len = strlen(folder);
-    if (folder_len > 0) {
-        char last = folder[folder_len - 1];
-        if (last != '/' && last != '\\') {
-            separator = "/";
-        }
+    name_len = strlen(name);
+    needs_separator = folder_len > 0 && !is_path_separator(folder[folder_len - 1]);
+
+    joined = (char *)malloc(folder_len + (size_t)needs_separator + name_len + 1);
+    if (!joined) {
+        return NULL;
     }
 
-    written = snprintf(out, out_size, "%s%s%s", folder, separator, name);
-    if (written < 0 || (size_t)written >= out_size) {
-        return -1;
+    memcpy(joined, folder, folder_len);
+    if (needs_separator) {
+        joined[folder_len] = PATH_SEPARATOR;
     }
+    memcpy(joined + folder_len + (size_t)needs_separator, name, name_len + 1);
 
-    return 0;
+    return joined;
 }
 
 static int line_starts_with(const char *line, const char *prefix) {
@@ -134,49 +383,47 @@ static void trim_line_ending(char *line) {
     }
 }
 
-static int is_absolute_path(const char *path) {
-    if (!path || path[0] == '\0') {
-        return 0;
-    }
-
-#ifdef _WIN32
-    if (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':') {
-        return 1;
-    }
-
-    if ((path[0] == '\\' && path[1] == '\\') || path[0] == '/' || path[0] == '\\') {
-        return 1;
-    }
-
-    return 0;
-#else
-    return path[0] == '/';
-#endif
-}
-
 static char *absolute_path_copy(const char *path) {
-    char cwd[PATH_BUFFER_SIZE];
-    char absolute_path[PATH_BUFFER_SIZE];
-
     if (!path) {
         return NULL;
     }
 
-    if (is_absolute_path(path)) {
-        return duplicate_string(path);
+#ifdef _WIN32
+    {
+        char *full_path = get_full_path_copy_windows(path);
+        if (!full_path) {
+            fprintf(stderr, "Failed to resolve absolute path: %s\n", path);
+        }
+        return full_path;
     }
+#else
+    {
+        char *cwd;
+        char *joined;
+        char *resolved;
 
-    if (!getcwd(cwd, sizeof(cwd))) {
-        perror("getcwd");
-        return NULL;
+        cwd = getcwd(NULL, 0);
+        if (!cwd) {
+            perror("getcwd");
+            return NULL;
+        }
+
+        joined = build_path_alloc(cwd, path);
+        free(cwd);
+        if (!joined) {
+            return NULL;
+        }
+
+        resolved = realpath(joined, NULL);
+        if (!resolved) {
+            resolved = joined;
+        } else {
+            free(joined);
+        }
+
+        return resolved;
     }
-
-    if (build_path(absolute_path, sizeof(absolute_path), cwd, path) != 0) {
-        fprintf(stderr, "Absolute path is too long: %s\n", path);
-        return NULL;
-    }
-
-    return duplicate_string(absolute_path);
+#endif
 }
 
 static int str_ends_with(const char *str, const char *suffix) {
@@ -215,12 +462,65 @@ static int find_path_index(char **paths, size_t count, const char *target_path) 
     size_t i;
 
     for (i = 0; i < count; i++) {
-        if (paths[i] && strcmp(paths[i], target_path) == 0) {
+        if (paths[i] && path_equals(paths[i], target_path)) {
             return (int)i;
         }
     }
 
     return -1;
+}
+
+static int path_exists(const char *path) {
+#ifdef _WIN32
+    wchar_t *native_path = build_windows_extended_path_w(path);
+    DWORD attrs;
+
+    if (!native_path) {
+        return 0;
+    }
+
+    attrs = GetFileAttributesW(native_path);
+    free(native_path);
+    return attrs != INVALID_FILE_ATTRIBUTES;
+#else
+    struct stat st;
+    return stat(path, &st) == 0;
+#endif
+}
+
+static int rename_path(const char *old_path, const char *new_path) {
+#ifdef _WIN32
+    wchar_t *native_old = build_windows_extended_path_w(old_path);
+    wchar_t *native_new = build_windows_extended_path_w(new_path);
+    int ok;
+
+    if (!native_old || !native_new) {
+        free(native_old);
+        free(native_new);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    ok = MoveFileExW(native_old, native_new, 0) != 0;
+    free(native_old);
+    free(native_new);
+
+    if (!ok) {
+        DWORD err = GetLastError();
+        if (err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS) {
+            errno = EEXIST;
+        } else if (err == ERROR_ACCESS_DENIED) {
+            errno = EACCES;
+        } else {
+            errno = EIO;
+        }
+        return -1;
+    }
+
+    return 0;
+#else
+    return rename(old_path, new_path);
+#endif
 }
 
 static int confirm_operation(const char *prompt, size_t count) {
@@ -449,55 +749,121 @@ static int parse_quantifier(const char *pattern, size_t *index, PatternToken *to
     return 0;
 }
 
+static int is_escaped_character(const char *text, size_t index) {
+    size_t backslashes = 0;
+
+    while (index > 0 && text[index - 1] == '\\') {
+        backslashes++;
+        index--;
+    }
+
+    return (backslashes % 2) != 0;
+}
+
 static int compile_pattern(const char *pattern, CompiledPattern *compiled, char *error_buf,
                            size_t error_buf_size) {
     PatternToken *tokens = NULL;
+    char *pattern_body = NULL;
+    size_t body_start = 0;
+    size_t body_end;
     size_t count = 0;
     size_t capacity = 0;
     size_t i = 0;
+    size_t pattern_len;
 
     if (!pattern || !compiled) {
         return -1;
     }
 
-    while (pattern[i] != '\0') {
+    memset(compiled, 0, sizeof(*compiled));
+
+    pattern_len = strlen(pattern);
+    if (pattern_len > REGEX_MAX_PATTERN_LENGTH) {
+        snprintf(error_buf, error_buf_size,
+                 "pattern too long (max %d characters)", REGEX_MAX_PATTERN_LENGTH);
+        return -1;
+    }
+
+    body_end = pattern_len;
+    if (pattern_len > 0 && pattern[0] == '^') {
+        compiled->anchor_start = 1;
+        body_start = 1;
+    }
+
+    if (body_end > body_start && pattern[body_end - 1] == '$' &&
+        !is_escaped_character(pattern, body_end - 1)) {
+        compiled->anchor_end = 1;
+        body_end--;
+    }
+
+    pattern_body = (char *)malloc((body_end - body_start) + 1);
+    if (!pattern_body) {
+        perror("malloc");
+        return -1;
+    }
+
+    memcpy(pattern_body, pattern + body_start, body_end - body_start);
+    pattern_body[body_end - body_start] = '\0';
+
+    while (pattern_body[i] != '\0') {
         PatternToken token;
         memset(&token, 0, sizeof(token));
 
-        if (pattern[i] == '[') {
-            if (parse_char_class(pattern, &i, &token, error_buf, error_buf_size) != 0) {
+        if (pattern_body[i] == '*' || pattern_body[i] == '+' || pattern_body[i] == '?' ||
+            pattern_body[i] == '{' || pattern_body[i] == '}') {
+            snprintf(error_buf, error_buf_size, "quantifier without a target token");
+            free(pattern_body);
+            return -1;
+        }
+
+        if (pattern_body[i] == '[') {
+            if (parse_char_class(pattern_body, &i, &token, error_buf, error_buf_size) != 0) {
                 free(tokens);
+                free(pattern_body);
                 return -1;
             }
-        } else if (pattern[i] == '.') {
+        } else if (pattern_body[i] == '.') {
             token.type = PATTERN_ANY;
             i++;
-        } else if (pattern[i] == '\\') {
-            if (pattern[i + 1] == '\0') {
+        } else if (pattern_body[i] == '\\') {
+            if (pattern_body[i + 1] == '\0') {
                 snprintf(error_buf, error_buf_size, "trailing escape character");
                 free(tokens);
+                free(pattern_body);
                 return -1;
             }
             token.type = PATTERN_LITERAL;
-            token.literal = pattern[i + 1];
+            token.literal = pattern_body[i + 1];
             i += 2;
         } else {
             token.type = PATTERN_LITERAL;
-            token.literal = pattern[i];
+            token.literal = pattern_body[i];
             i++;
         }
 
-        if (parse_quantifier(pattern, &i, &token, error_buf, error_buf_size) != 0) {
+        if (parse_quantifier(pattern_body, &i, &token, error_buf, error_buf_size) != 0) {
             free(tokens);
+            free(pattern_body);
+            return -1;
+        }
+
+        if (count >= REGEX_MAX_TOKEN_COUNT) {
+            snprintf(error_buf, error_buf_size,
+                     "pattern has too many tokens (max %d)", REGEX_MAX_TOKEN_COUNT);
+            free(tokens);
+            free(pattern_body);
             return -1;
         }
 
         if (append_pattern_token(&tokens, &count, &capacity, &token) != 0) {
             snprintf(error_buf, error_buf_size, "out of memory while compiling regex");
             free(tokens);
+            free(pattern_body);
             return -1;
         }
     }
+
+    free(pattern_body);
 
     compiled->tokens = tokens;
     compiled->count = count;
@@ -512,6 +878,8 @@ static void free_compiled_pattern(CompiledPattern *compiled) {
     free(compiled->tokens);
     compiled->tokens = NULL;
     compiled->count = 0;
+    compiled->anchor_start = 0;
+    compiled->anchor_end = 0;
 }
 
 static int token_matches_char(const PatternToken *token, unsigned char ch) {
@@ -547,41 +915,83 @@ static int max_repeats_for_token(const PatternToken *token, const char *text, si
     return repeats;
 }
 
-static int match_tokens_recursive(const PatternToken *tokens, size_t token_count, size_t token_index,
-                                  const char *text, size_t text_len, size_t position,
-                                  int require_full_match) {
-    int repeats;
-    const PatternToken *token;
-    int max_repeats;
+static int match_tokens_iterative(const CompiledPattern *pattern, const char *text,
+                                  size_t text_len, size_t start_index, int require_full_match) {
+    size_t state_size = text_len + 1;
+    unsigned char *current_states = NULL;
+    unsigned char *next_states = NULL;
+    size_t token_index;
+    int matched = 0;
 
-    if (token_index == token_count) {
-        if (require_full_match) {
-            return position == text_len;
-        }
-        return 1;
-    }
-
-    token = &tokens[token_index];
-    max_repeats = max_repeats_for_token(token, text, text_len, position);
-    if (max_repeats < token->min_repeat) {
+    current_states = (unsigned char *)calloc(state_size, sizeof(unsigned char));
+    next_states = (unsigned char *)calloc(state_size, sizeof(unsigned char));
+    if (!current_states || !next_states) {
+        free(current_states);
+        free(next_states);
         return 0;
     }
 
-    for (repeats = max_repeats; repeats >= token->min_repeat; repeats--) {
-        if (match_tokens_recursive(tokens, token_count, token_index + 1, text, text_len,
-                                   position + (size_t)repeats, require_full_match)) {
-            return 1;
+    current_states[start_index] = 1;
+
+    for (token_index = 0; token_index < pattern->count; token_index++) {
+        const PatternToken *token = &pattern->tokens[token_index];
+        size_t position;
+        int has_state = 0;
+
+        memset(next_states, 0, state_size * sizeof(unsigned char));
+
+        for (position = 0; position <= text_len; position++) {
+            int repeats;
+            int max_repeats;
+
+            if (!current_states[position]) {
+                continue;
+            }
+
+            max_repeats = max_repeats_for_token(token, text, text_len, position);
+            if (max_repeats < token->min_repeat) {
+                continue;
+            }
+
+            for (repeats = token->min_repeat; repeats <= max_repeats; repeats++) {
+                next_states[position + (size_t)repeats] = 1;
+                has_state = 1;
+            }
         }
 
-        if (repeats == 0) {
-            break;
+        if (!has_state) {
+            free(current_states);
+            free(next_states);
+            return 0;
+        }
+
+        {
+            unsigned char *tmp = current_states;
+            current_states = next_states;
+            next_states = tmp;
         }
     }
 
-    return 0;
+    if (require_full_match) {
+        matched = current_states[text_len] != 0;
+    } else {
+        size_t position;
+        for (position = 0; position <= text_len; position++) {
+            if (current_states[position]) {
+                matched = 1;
+                break;
+            }
+        }
+    }
+
+    free(current_states);
+    free(next_states);
+    return matched;
 }
 
 static int regex_match_compiled(const CompiledPattern *pattern, const char *text) {
+    size_t start_begin;
+    size_t start_end;
     size_t start;
     size_t text_len;
 
@@ -591,12 +1001,20 @@ static int regex_match_compiled(const CompiledPattern *pattern, const char *text
 
     text_len = strlen(text);
     if (pattern->count == 0) {
+        if (pattern->anchor_start && pattern->anchor_end) {
+            return text_len == 0;
+        }
         return 1;
     }
 
-    for (start = 0; start <= text_len; start++) {
-        if (match_tokens_recursive(pattern->tokens, pattern->count, 0, text, text_len, start,
-                                   0)) {
+    start_begin = 0;
+    start_end = text_len;
+    if (pattern->anchor_start) {
+        start_end = 0;
+    }
+
+    for (start = start_begin; start <= start_end; start++) {
+        if (match_tokens_iterative(pattern, text, text_len, start, pattern->anchor_end)) {
             return 1;
         }
     }
@@ -651,6 +1069,121 @@ static int matches_filter(const RenameOptions *options, const CompiledPattern *c
     return str_ends_with(name, options->extension);
 }
 
+#ifdef _WIN32
+static long long filetime_to_longlong(const FILETIME *time_value) {
+    ULARGE_INTEGER value;
+    value.LowPart = time_value->dwLowDateTime;
+    value.HighPart = time_value->dwHighDateTime;
+    return (long long)value.QuadPart;
+}
+
+static int scan_directory(const char *folder, const RenameOptions *options,
+                          const CompiledPattern *compiled_pattern, FileEntry **entries,
+                          size_t *count, size_t *capacity) {
+    char *search_pattern = NULL;
+    wchar_t *native_search = NULL;
+    HANDLE handle;
+    WIN32_FIND_DATAW find_data;
+    int status = 0;
+
+    search_pattern = build_path_alloc(folder, "*");
+    if (!search_pattern) {
+        perror("malloc");
+        return -1;
+    }
+
+    native_search = build_windows_extended_path_w(search_pattern);
+    free(search_pattern);
+    if (!native_search) {
+        perror("malloc");
+        return -1;
+    }
+
+    handle = FindFirstFileW(native_search, &find_data);
+    free(native_search);
+    if (handle == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Failed to open directory %s (Win32 error %lu)\n", folder,
+                (unsigned long)GetLastError());
+        return -1;
+    }
+
+    do {
+        char *entry_name = wide_to_utf8_copy(find_data.cFileName);
+        char *full_path;
+        int is_directory;
+
+        if (!entry_name) {
+            fprintf(stderr, "Failed to decode a Windows path component in %s\n", folder);
+            status = -1;
+            break;
+        }
+
+        if (strcmp(entry_name, ".") == 0 || strcmp(entry_name, "..") == 0) {
+            free(entry_name);
+            continue;
+        }
+
+        if (entry_name[0] == '.') {
+            free(entry_name);
+            continue;
+        }
+
+        full_path = build_path_alloc(folder, entry_name);
+        if (!full_path) {
+            perror("malloc");
+            free(entry_name);
+            status = -1;
+            break;
+        }
+
+        is_directory = (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (is_directory) {
+            if (options->recursive &&
+                (find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+                if (scan_directory(full_path, options, compiled_pattern, entries, count,
+                                   capacity) != 0) {
+                    free(full_path);
+                    free(entry_name);
+                    status = -1;
+                    break;
+                }
+            }
+
+            free(full_path);
+            free(entry_name);
+            continue;
+        }
+
+        if (!matches_filter(options, compiled_pattern, entry_name)) {
+            free(full_path);
+            free(entry_name);
+            continue;
+        }
+
+        if (append_file_entry(entries, count, capacity, folder, entry_name,
+                              filetime_to_longlong(&find_data.ftCreationTime),
+                              ((long long)find_data.nFileSizeHigh << 32) |
+                                  (long long)find_data.nFileSizeLow) != 0) {
+            free(full_path);
+            free(entry_name);
+            status = -1;
+            break;
+        }
+
+        free(full_path);
+        free(entry_name);
+    } while (FindNextFileW(handle, &find_data));
+
+    if (status == 0 && GetLastError() != ERROR_NO_MORE_FILES) {
+        fprintf(stderr, "Failed while reading directory %s (Win32 error %lu)\n", folder,
+                (unsigned long)GetLastError());
+        status = -1;
+    }
+
+    FindClose(handle);
+    return status;
+}
+#else
 static int scan_directory(const char *folder, const RenameOptions *options,
                           const CompiledPattern *compiled_pattern, FileEntry **entries,
                           size_t *count, size_t *capacity) {
@@ -665,7 +1198,6 @@ static int scan_directory(const char *folder, const RenameOptions *options,
     }
 
     while (1) {
-        char full_path[PATH_BUFFER_SIZE];
         struct stat st;
 
         errno = 0;
@@ -686,41 +1218,52 @@ static int scan_directory(const char *folder, const RenameOptions *options,
             continue;
         }
 
-        if (build_path(full_path, sizeof(full_path), folder, entry->d_name) != 0) {
-            fprintf(stderr, "Path too long while scanning: %s\n", entry->d_name);
-            status = -1;
-            break;
-        }
-
-        if (stat(full_path, &st) != 0) {
-            fprintf(stderr, "Failed to stat %s: %s\n", full_path, strerror(errno));
-            status = -1;
-            break;
-        }
-
-        if (S_ISDIR(st.st_mode)) {
-            if (options->recursive) {
-                if (scan_directory(full_path, options, compiled_pattern, entries, count, capacity) !=
-                    0) {
-                    status = -1;
-                    break;
-                }
+        {
+            char *full_path = build_path_alloc(folder, entry->d_name);
+            if (!full_path) {
+                perror("malloc");
+                status = -1;
+                break;
             }
-            continue;
-        }
 
-        if (!S_ISREG(st.st_mode)) {
-            continue;
-        }
+            if (stat(full_path, &st) != 0) {
+                fprintf(stderr, "Failed to stat %s: %s\n", full_path, strerror(errno));
+                free(full_path);
+                status = -1;
+                break;
+            }
 
-        if (!matches_filter(options, compiled_pattern, entry->d_name)) {
-            continue;
-        }
+            if (S_ISDIR(st.st_mode)) {
+                if (options->recursive) {
+                    if (scan_directory(full_path, options, compiled_pattern, entries, count,
+                                       capacity) != 0) {
+                        free(full_path);
+                        status = -1;
+                        break;
+                    }
+                }
+                free(full_path);
+                continue;
+            }
 
-        if (append_file_entry(entries, count, capacity, folder, entry->d_name, (long long)st.st_ctime,
-                              (long long)st.st_size) != 0) {
-            status = -1;
-            break;
+            if (!S_ISREG(st.st_mode)) {
+                free(full_path);
+                continue;
+            }
+
+            if (!matches_filter(options, compiled_pattern, entry->d_name)) {
+                free(full_path);
+                continue;
+            }
+
+            if (append_file_entry(entries, count, capacity, folder, entry->d_name,
+                                  (long long)st.st_ctime, (long long)st.st_size) != 0) {
+                free(full_path);
+                status = -1;
+                break;
+            }
+
+            free(full_path);
         }
     }
 
@@ -731,6 +1274,7 @@ static int scan_directory(const char *folder, const RenameOptions *options,
 
     return status;
 }
+#endif
 
 int collect_matching_files(const RenameOptions *options, FileEntry **files_out, size_t *count_out) {
     FileEntry *files = NULL;
@@ -1089,6 +1633,231 @@ static int rewrite_history_without_last_batch(const char *history_path, const Hi
     return 0;
 }
 
+static char *path_parent_copy(const char *path) {
+    const char *slash = strrchr(path, '/');
+    const char *backslash = strrchr(path, '\\');
+    const char *last_separator = slash;
+    size_t length;
+    char *parent;
+
+    if (!path) {
+        return NULL;
+    }
+
+    if (!last_separator || (backslash && backslash > last_separator)) {
+        last_separator = backslash;
+    }
+
+    if (!last_separator) {
+        return duplicate_string(".");
+    }
+
+    length = (size_t)(last_separator - path);
+    if (length == 0) {
+        return duplicate_string((last_separator == backslash) ? "\\" : "/");
+    }
+
+    parent = (char *)malloc(length + 1);
+    if (!parent) {
+        return NULL;
+    }
+
+    memcpy(parent, path, length);
+    parent[length] = '\0';
+    return parent;
+}
+
+static int generate_unique_temp_path(const char *source_path, size_t sequence, char **old_paths,
+                                     char **new_paths, char **temp_paths, size_t count,
+                                     char **temp_path_out) {
+    char *parent = NULL;
+    unsigned long pid_value = (unsigned long)get_process_id();
+    size_t attempt;
+
+    if (!source_path || !temp_path_out) {
+        return -1;
+    }
+
+    parent = path_parent_copy(source_path);
+    if (!parent) {
+        return -1;
+    }
+
+    for (attempt = 0; attempt < TEMP_NAME_ATTEMPTS; attempt++) {
+        char temp_name[NAME_BUFFER_SIZE];
+        char *candidate;
+        int written = snprintf(temp_name, sizeof(temp_name),
+                               ".renamer_tmp_%lld_%lu_%zu_%zu.tmp", (long long)time(NULL),
+                               pid_value, sequence + 1, attempt + 1);
+
+        if (written < 0 || (size_t)written >= sizeof(temp_name)) {
+            continue;
+        }
+
+        candidate = build_path_alloc(parent, temp_name);
+        if (!candidate) {
+            free(parent);
+            return -1;
+        }
+
+        if (!path_exists(candidate) && find_path_index(old_paths, count, candidate) < 0 &&
+            find_path_index(new_paths, count, candidate) < 0 &&
+            find_path_index(temp_paths, count, candidate) < 0) {
+            *temp_path_out = candidate;
+            free(parent);
+            return 0;
+        }
+
+        free(candidate);
+    }
+
+    free(parent);
+    return -1;
+}
+
+static int execute_two_phase_renames(char **old_paths, char **new_paths, size_t count,
+                                     size_t *renamed_count_out) {
+    char **temp_paths = NULL;
+    int *active = NULL;
+    int *state = NULL;
+    size_t i;
+    size_t renamed_count = 0;
+    int status = -1;
+
+    temp_paths = (char **)calloc(count, sizeof(char *));
+    active = (int *)calloc(count, sizeof(int));
+    state = (int *)calloc(count, sizeof(int));
+    if (!temp_paths || !active || !state) {
+        perror("calloc");
+        goto cleanup;
+    }
+
+    for (i = 0; i < count; i++) {
+        if (path_equals(old_paths[i], new_paths[i])) {
+            continue;
+        }
+
+        active[i] = 1;
+        if (!path_exists(old_paths[i])) {
+            fprintf(stderr, "Rename conflict: source path is missing: %s\n", old_paths[i]);
+            goto cleanup;
+        }
+    }
+
+    for (i = 0; i < count; i++) {
+        size_t j;
+        for (j = i + 1; j < count; j++) {
+            if (path_equals(new_paths[i], new_paths[j])) {
+                fprintf(stderr, "Rename conflict: generated duplicate target path %s\n",
+                        new_paths[i]);
+                goto cleanup;
+            }
+        }
+    }
+
+    for (i = 0; i < count; i++) {
+        int source_index;
+
+        if (!active[i]) {
+            continue;
+        }
+
+        if (!path_exists(new_paths[i])) {
+            continue;
+        }
+
+        source_index = find_path_index(old_paths, count, new_paths[i]);
+        if (source_index < 0 || !active[source_index]) {
+            fprintf(stderr, "Rename conflict: target already exists: %s\n", new_paths[i]);
+            goto cleanup;
+        }
+    }
+
+    for (i = 0; i < count; i++) {
+        if (!active[i]) {
+            continue;
+        }
+
+        if (generate_unique_temp_path(old_paths[i], i, old_paths, new_paths, temp_paths, count,
+                                      &temp_paths[i]) != 0) {
+            fprintf(stderr, "Failed to allocate a temporary rename path for %s\n", old_paths[i]);
+            goto cleanup;
+        }
+    }
+
+    for (i = 0; i < count; i++) {
+        if (!active[i]) {
+            continue;
+        }
+
+        if (rename_path(old_paths[i], temp_paths[i]) != 0) {
+            fprintf(stderr, "Failed to move %s to temporary path %s: %s\n", old_paths[i],
+                    temp_paths[i], strerror(errno));
+            goto rollback;
+        }
+
+        state[i] = 1;
+    }
+
+    for (i = 0; i < count; i++) {
+        if (!active[i]) {
+            continue;
+        }
+
+        if (rename_path(temp_paths[i], new_paths[i]) != 0) {
+            fprintf(stderr, "Failed to rename %s to %s: %s\n", old_paths[i], new_paths[i],
+                    strerror(errno));
+            goto rollback;
+        }
+
+        state[i] = 2;
+        renamed_count++;
+    }
+
+    status = 0;
+    goto cleanup;
+
+rollback:
+    for (i = count; i > 0; i--) {
+        size_t idx = i - 1;
+
+        if (state[idx] != 2) {
+            continue;
+        }
+
+        if (rename_path(new_paths[idx], temp_paths[idx]) != 0) {
+            fprintf(stderr, "Rollback warning: failed to move %s back to %s\n", new_paths[idx],
+                    temp_paths[idx]);
+        } else {
+            state[idx] = 1;
+        }
+    }
+
+    for (i = count; i > 0; i--) {
+        size_t idx = i - 1;
+
+        if (state[idx] != 1) {
+            continue;
+        }
+
+        if (rename_path(temp_paths[idx], old_paths[idx]) != 0) {
+            fprintf(stderr, "Rollback warning: failed to restore %s\n", old_paths[idx]);
+        } else {
+            state[idx] = 0;
+        }
+    }
+
+cleanup:
+    if (renamed_count_out) {
+        *renamed_count_out = renamed_count;
+    }
+
+    free_string_array(temp_paths, count);
+    free(active);
+    free(state);
+    return status;
+}
+
 int perform_renames(const RenameOptions *options, FileEntry *files, size_t count,
                     const char *history_path) {
     char **new_names = NULL;
@@ -1114,8 +1883,6 @@ int perform_renames(const RenameOptions *options, FileEntry *files, size_t count
         char generated_name[NAME_BUFFER_SIZE];
         const char *target_extension = options->extension;
         int written;
-        char old_path[PATH_BUFFER_SIZE];
-        char new_path[PATH_BUFFER_SIZE];
 
         if (options->match_mode == MATCH_MODE_REGEX) {
             target_extension = extract_extension(files[i].name);
@@ -1134,46 +1901,10 @@ int perform_renames(const RenameOptions *options, FileEntry *files, size_t count
             goto cleanup;
         }
 
-        if (build_path(old_path, sizeof(old_path), files[i].folder_path, files[i].name) != 0 ||
-            build_path(new_path, sizeof(new_path), files[i].folder_path, new_names[i]) != 0) {
-            fprintf(stderr, "Path too long while preparing rename for %s\n", files[i].name);
-            goto cleanup;
-        }
-
-        old_paths[i] = duplicate_string(old_path);
-        new_paths[i] = duplicate_string(new_path);
+        old_paths[i] = build_path_alloc(files[i].folder_path, files[i].name);
+        new_paths[i] = build_path_alloc(files[i].folder_path, new_names[i]);
         if (!old_paths[i] || !new_paths[i]) {
             perror("malloc");
-            goto cleanup;
-        }
-    }
-
-    for (i = 0; i < count; i++) {
-        size_t j;
-        for (j = i + 1; j < count; j++) {
-            if (strcmp(new_paths[i], new_paths[j]) == 0) {
-                fprintf(stderr, "Rename conflict: generated duplicate target path %s\n", new_paths[i]);
-                goto cleanup;
-            }
-        }
-    }
-
-    for (i = 0; i < count; i++) {
-        struct stat st;
-
-        if (strcmp(old_paths[i], new_paths[i]) == 0) {
-            continue;
-        }
-
-        if (stat(new_paths[i], &st) == 0) {
-            int source_index = find_path_index(old_paths, count, new_paths[i]);
-            if (source_index >= 0) {
-                fprintf(stderr,
-                        "Rename conflict: target path %s is also a source path in this batch.\n",
-                        new_paths[i]);
-            } else {
-                fprintf(stderr, "Rename conflict: target already exists: %s\n", new_paths[i]);
-            }
             goto cleanup;
         }
     }
@@ -1201,21 +1932,13 @@ int perform_renames(const RenameOptions *options, FileEntry *files, size_t count
         }
     }
 
+    if (execute_two_phase_renames(old_paths, new_paths, count, &renamed_count) != 0) {
+        fprintf(stderr, "Operation failed; rollback was attempted for completed steps.\n");
+        goto cleanup;
+    }
+
     for (i = 0; i < count; i++) {
-        if (strcmp(old_paths[i], new_paths[i]) == 0) {
-            printf("%s -> %s\n", old_paths[i], new_paths[i]);
-            continue;
-        }
-
-        if (rename(old_paths[i], new_paths[i]) != 0) {
-            fprintf(stderr, "Failed to rename %s to %s: %s\n", old_paths[i], new_paths[i],
-                    strerror(errno));
-            fprintf(stderr, "Operation stopped; some files may already be renamed.\n");
-            goto cleanup;
-        }
-
         printf("%s -> %s\n", old_paths[i], new_paths[i]);
-        renamed_count++;
     }
 
     if (renamed_count > 0 && history_path && history_path[0] != '\0') {
@@ -1238,6 +1961,7 @@ cleanup:
 int undo_last_batch(const char *history_path, int assume_yes) {
     HistoryBatch batch;
     size_t i;
+    size_t renamed_count = 0;
     int status = -1;
 
     memset(&batch, 0, sizeof(batch));
@@ -1266,42 +1990,17 @@ int undo_last_batch(const char *history_path, int assume_yes) {
         }
     }
 
+    if (execute_two_phase_renames(batch.new_paths, batch.old_paths, batch.count,
+                                  &renamed_count) != 0) {
+        fprintf(stderr, "Undo failed; rollback was attempted for completed steps.\n");
+        goto cleanup;
+    }
+
     for (i = 0; i < batch.count; i++) {
-        struct stat st;
-
-        if (stat(batch.new_paths[i], &st) != 0) {
-            fprintf(stderr, "Undo failed: current path missing: %s\n", batch.new_paths[i]);
-            goto cleanup;
-        }
-
-        if (stat(batch.old_paths[i], &st) == 0) {
-            int source_index = find_path_index(batch.new_paths, batch.count, batch.old_paths[i]);
-            if (source_index < 0) {
-                fprintf(stderr, "Undo conflict: original path already exists: %s\n", batch.old_paths[i]);
-                goto cleanup;
-            }
-        }
+        printf("%s -> %s\n", batch.new_paths[i], batch.old_paths[i]);
     }
 
-    for (i = batch.count; i > 0; i--) {
-        size_t idx = i - 1;
-
-        if (strcmp(batch.new_paths[idx], batch.old_paths[idx]) == 0) {
-            printf("%s -> %s\n", batch.new_paths[idx], batch.old_paths[idx]);
-            continue;
-        }
-
-        if (rename(batch.new_paths[idx], batch.old_paths[idx]) != 0) {
-            fprintf(stderr, "Failed to undo rename %s to %s: %s\n", batch.new_paths[idx],
-                    batch.old_paths[idx], strerror(errno));
-            fprintf(stderr, "Undo stopped; some files may already be restored.\n");
-            goto cleanup;
-        }
-
-        printf("%s -> %s\n", batch.new_paths[idx], batch.old_paths[idx]);
-    }
-
-    if (rewrite_history_without_last_batch(history_path, &batch) != 0) {
+    if (renamed_count > 0 && rewrite_history_without_last_batch(history_path, &batch) != 0) {
         fprintf(stderr,
                 "Warning: undo succeeded but failed to update history file %s.\n",
                 history_path);

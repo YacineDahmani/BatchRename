@@ -6,3 +6,4 @@ tmp_conflict/
 *.obj
 .rename_history
 tmp_manual/
+.tmp_impl_test/

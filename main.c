@@ -19,7 +19,7 @@ static void print_usage(const char *program_name) {
             "  --yes              Skip confirmation prompts.\n"
             "  -r, --recursive    Process subfolders recursively.\n"
             "  --sort <mode>      Sort mode: name, ctime, size.\n"
-            "  --regex <pattern>  Regex filter (mutually exclusive with extension).\n",
+            "  --regex <pattern>  Regex filter (supports ^ and $ anchors).\n",
             program_name, program_name, program_name);
 }
 
